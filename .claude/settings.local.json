@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -v '^nan$')",
+      "Bash(grep -v '^$')",
+      "Bash(python3:*)",
+      "Bash(python preprocess.py)",
+      "Bash(python download_images.py)",
+      "Bash(python build_item_features.py)",
+      "Bash(pip install sentence-transformers -q)"
+    ]
+  }
+}
