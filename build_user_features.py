@@ -5,6 +5,7 @@ import re
 import torch
 import clip
 from collections import Counter
+from sklearn.manifold import TSNE
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -38,7 +39,6 @@ common_stop_words = {
 }
 
 def extract_keywords(text):
-    """从文本中提取关键词"""
     if not isinstance(text, str) or not text:
         return ""
     
@@ -51,7 +51,6 @@ def extract_keywords(text):
     return ' '.join(top_keywords)
 
 def extract_color_from_text(text):
-    """从文本中提取颜色信息"""
     if not isinstance(text, str) or not text:
         return []
     
@@ -65,7 +64,6 @@ def extract_color_from_text(text):
     return colors_found
 
 def extract_size_from_text(text):
-    """从文本中提取尺寸信息"""
     if not isinstance(text, str) or not text:
         return []
     
@@ -76,6 +74,36 @@ def extract_size_from_text(text):
     sizes_found = [size for size in size_keywords if size in text_lower]
     
     return sizes_found
+
+def encode_text_with_clip(text):
+    if not isinstance(text, str) or not text:
+        return None
+    
+    text = text[:77]
+    text_tokens = clip.tokenize([text], truncate=True).to(device)
+    
+    with torch.no_grad():
+        text_features = model.encode_text(text_tokens)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    
+    return text_features.cpu().numpy()[0]
+
+def apply_tsne(vectors, n_components=3):
+    if len(vectors) == 0:
+        return np.array([])
+    
+    if len(vectors) < n_components:
+        return np.array([np.zeros(n_components) for _ in range(len(vectors))])
+    
+    tsne = TSNE(n_components=n_components, random_state=42, perplexity=min(30, len(vectors) - 1))
+    reduced_vectors = tsne.fit_transform(vectors)
+    
+    return reduced_vectors
+
+def vector_to_list(vector):
+    if vector is None:
+        return []
+    return vector.tolist()
 
 print("Processing user features...")
 user_features = {}
@@ -137,7 +165,7 @@ for col in user_feat_df.columns:
     else:
         user_feat_df[col].fillna('', inplace=True)
 
-print("Processing CLIP encoding...")
+print("Processing CLIP encoding for user reviews...")
 user_texts = []
 user_ids = []
 
@@ -147,7 +175,7 @@ for user_id, group in reviews_df.groupby('reviewerID'):
     user_ids.append(user_id)
 
 print(f"Encoding {len(user_texts)} user texts...")
-content_vectors_list = []
+content_clip_vectors = []
 
 batch_size = 32
 for i in range(0, len(user_texts), batch_size):
@@ -159,20 +187,23 @@ for i in range(0, len(user_texts), batch_size):
         text_features = model.encode_text(text_tokens)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     
-    content_vectors_list.append(text_features.cpu().numpy())
+    content_clip_vectors.append(text_features.cpu().numpy())
     
     if (i + batch_size) % 100 == 0:
         print(f"Processed {i + batch_size}/{len(user_texts)}")
 
-content_vectors_array = np.vstack(content_vectors_list)
+content_clip_vectors_array = np.vstack(content_clip_vectors)
 
-print(f"Content vectors shape: {content_vectors_array.shape}")
+print(f"Content CLIP vectors shape: {content_clip_vectors_array.shape}")
 
-user_feat_df['content_feat_idx'] = range(len(user_feat_df))
+print("Applying TSNE dimensionality reduction...")
+print("Reducing user content vectors to 3D...")
+content_tsne_vectors = apply_tsne(content_clip_vectors_array, n_components=3)
 
-print("Saving content vectors to numpy file...")
-np.save('new_feat/user_content_feat.npy', content_vectors_array)
-print("Saved content vectors to new_feat/user_content_feat.npy")
+print(f"Content TSNE vectors shape: {content_tsne_vectors.shape}")
+
+print("Adding reduced vectors to DataFrame...")
+user_feat_df['content_vector'] = [vector_to_list(v) for v in content_tsne_vectors]
 
 print("Saving user features to CSV...")
 user_feat_df.to_csv('new_feat/user.csv', index=False, encoding='utf-8')
@@ -202,17 +233,22 @@ print(f"  Users with top_category: {len([idx for idx in user_feat_df['top_catego
 print(f"  Users with top_style_colors: {len([idx for idx, colors in zip(user_feat_df['reviewerID'], user_feat_df['top_style_colors']) if len(colors) > 0])}")
 print(f"  Users with top_style_sizes: {len([idx for idx, sizes in zip(user_feat_df['reviewerID'], user_feat_df['top_style_sizes']) if len(sizes) > 0])}")
 
-print(f"\nContent vector statistics:")
-print(f"  Shape: {content_vectors_array.shape}")
-print(f"  Mean: {content_vectors_array.mean():.6f}")
-print(f"  Std: {content_vectors_array.std():.6f}")
-print(f"  Min: {content_vectors_array.min():.6f}")
-print(f"  Max: {content_vectors_array.max():.6f}")
+print(f"\nContent TSNE vector statistics:")
+print(f"  Shape: {content_tsne_vectors.shape}")
+print(f"  Mean: {content_tsne_vectors.mean():.6f}")
+print(f"  Std: {content_tsne_vectors.std():.6f}")
+print(f"  Min: {content_tsne_vectors.min():.6f}")
+print(f"  Max: {content_tsne_vectors.max():.6f}")
 
 print("\n=== Feature columns ===")
 print(f"Columns in user.csv: {list(user_feat_df.columns)}")
 
+print("\n=== Sample data ===")
+print(f"First user ID: {user_feat_df.iloc[0]['reviewerID']}")
+print(f"Content vector (first 3 dims): {user_feat_df.iloc[0]['content_vector']}")
+print(f"Review count: {user_feat_df.iloc[0]['review_count']}")
+print(f"Average rating: {user_feat_df.iloc[0]['avg_rating']:.2f}")
+
 print("\n=== Completed ===")
 print("Generated files:")
-print("  - new_feat/user.csv (user features with indices)")
-print("  - new_feat/user_content_feat.npy (user review CLIP vectors)")
+print("  - new_feat/user.csv (user features with 3D content vectors stored as lists)")
