@@ -1,50 +1,61 @@
-import pandas as pd
+"""Split each user's interactions into train/test subsets.
+
+The current project keeps a simple chronological split: the first 70% of a
+user's reviews become training interactions and the remainder become test
+interactions. The outputs are later used for feature generation and model
+training/evaluation.
+"""
+
 import numpy as np
+import pandas as pd
 
-# 读取数据
-print("Loading reviews data...")
-reviews_df = pd.read_csv('new_dataset/reviews.csv')
+TRAIN_RATIO = 0.7
+DATA_DIR = 'new_dataset'
 
-# 按reviewerID分组，对每个用户的评论按时间排序
-print("Processing user data...")
-user_item_list = []
-train_reviews_list = []
 
-for user_id, group in reviews_df.groupby('reviewerID'):
-    # 按unixReviewTime排序
-    group = group.sort_values('unixReviewTime').reset_index(drop=True)
+def main():
+    """Generate `user_item.csv` and `train_reviews.csv` from cleaned reviews."""
+    print("Loading reviews data...")
+    reviews_df = pd.read_csv(f'{DATA_DIR}/reviews.csv')
 
-    # 计算70%和30%的分割点
-    total_reviews = len(group)
-    split_idx = int(np.ceil(total_reviews * 0.7))
+    print("Processing user data...")
+    user_item_list = []
+    train_reviews_list = []
 
-    # 分割训练集和测试集
-    train_group = group.iloc[:split_idx]
-    test_group = group.iloc[split_idx:]
+    # Build train/test sequences user by user to preserve interaction order.
+    for user_id, group in reviews_df.groupby('reviewerID'):
+        group = group.sort_values('unixReviewTime').reset_index(drop=True)
 
-    # 获取商品ID列表
-    train_items = '|'.join(train_group['asin'].astype(str).unique())
-    test_items = '|'.join(test_group['asin'].astype(str).unique())
+        total_reviews = len(group)
+        split_idx = int(np.ceil(total_reviews * TRAIN_RATIO))
 
-    # 添加到user_item列表
-    if train_items and test_items:  # 只保留既有训练集又有测试集的用户
+        train_group = group.iloc[:split_idx]
+        test_group = group.iloc[split_idx:]
+
+        train_items = '|'.join(train_group['asin'].astype(str).unique())
+        test_items = '|'.join(test_group['asin'].astype(str).unique())
+
+        # The recommendation pipeline expects both train and test items per user.
+        if not train_items or not test_items:
+            continue
+
         user_item_list.append({
             'user_id': user_id,
             'train': train_items,
             'test': test_items
         })
-
-        # 添加训练集评论
         train_reviews_list.append(train_group)
 
-# 生成user_item.csv
-user_item_df = pd.DataFrame(user_item_list)
-user_item_df.to_csv('new_dataset/user_item.csv', index=False, encoding='utf-8')
-print(f"Saved {len(user_item_df)} users to new_dataset/user_item.csv")
+    user_item_df = pd.DataFrame(user_item_list)
+    user_item_df.to_csv(f'{DATA_DIR}/user_item.csv', index=False, encoding='utf-8')
+    print(f"Saved {len(user_item_df)} users to {DATA_DIR}/user_item.csv")
 
-# 生成train_reviews.csv
-train_reviews_df = pd.concat(train_reviews_list, ignore_index=True)
-train_reviews_df.to_csv('new_dataset/train_reviews.csv', index=False, encoding='utf-8')
-print(f"Saved {len(train_reviews_df)} training reviews to new_dataset/train_reviews.csv")
+    train_reviews_df = pd.concat(train_reviews_list, ignore_index=True)
+    train_reviews_df.to_csv(f'{DATA_DIR}/train_reviews.csv', index=False, encoding='utf-8')
+    print(f"Saved {len(train_reviews_df)} training reviews to {DATA_DIR}/train_reviews.csv")
 
-print("Data splitting completed!")
+    print("Data splitting completed!")
+
+
+if __name__ == '__main__':
+    main()

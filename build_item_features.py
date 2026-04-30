@@ -1,31 +1,34 @@
-import pandas as pd
-import numpy as np
+"""构建商品侧多模态特征。
+
+输出结构与当前训练流程完全对齐，包括：
+1. 商品元数据中的数值特征；
+2. 标题关键词；
+3. 标题、图像、特征、描述四种模态的 64 维向量。
+"""
+
 import os
 import re
-import torch
-import clip
-from PIL import Image
 from collections import Counter
-from sklearn.manifold import TSNE
-import warnings
-warnings.filterwarnings('ignore')
 
-os.makedirs('new_feat', exist_ok=True)
+import clip
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from sklearn.decomposition import PCA
 
-print("Loading data...")
-items_df = pd.read_csv('new_dataset/item.csv')
-print(f"Loaded {len(items_df)} items")
+OUTPUT_DIR = 'new_feat'
+ITEM_OUTPUT_PATH = f'{OUTPUT_DIR}/item.csv'
+VECTOR_DIM = 512
+REDUCED_DIM = 64
+TEXT_BATCH_SIZE = 64
+IMAGE_BATCH_SIZE = 32
 
-print("Loading CLIP model...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model, preprocess = clip.load("ViT-B/32", device=device)
-print(f"CLIP model loaded on {device}")
-
-common_stop_words = {
-    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be', 
-    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 
-    'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 
+COMMON_STOP_WORDS = {
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+    'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can',
     'this', 'that', 'these', 'those', 'it', 'its', 'they', 'them', 'their',
     'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'how', 'all',
     'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such',
@@ -35,202 +38,260 @@ common_stop_words = {
     'again', 'further', 'while', 'up', 'down', 'off', 'over', 'out'
 }
 
-def extract_keywords(title):
-    if not isinstance(title, str) or not title:
+
+def extract_keywords(text, top_k=10):
+    """从商品标题中提取紧凑的关键词摘要。"""
+    if not isinstance(text, str) or not text:
         return ""
-    
-    words = re.findall(r'\b[a-zA-Z]{3,}\b', title.lower())
-    words = [word for word in words if word not in common_stop_words]
-    
-    word_freq = Counter(words)
-    top_keywords = [word for word, freq in word_freq.most_common(10)]
-    
+
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+    filtered_words = [word for word in words if word not in COMMON_STOP_WORDS]
+    top_keywords = [word for word, _ in Counter(filtered_words).most_common(top_k)]
     return ' '.join(top_keywords)
 
-def encode_text_with_clip(text):
-    if not isinstance(text, str) or not text:
-        return None
-    
-    text = text[:77]
-    text_tokens = clip.tokenize([text], truncate=True).to(device)
-    
-    with torch.no_grad():
-        text_features = model.encode_text(text_tokens)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    
-    return text_features.cpu().numpy()[0]
 
-def load_and_encode_image(asin):
-    if not isinstance(asin, str) or not asin:
-        return None
-    
-    try:
-        image_path = os.path.join('images', f'{asin}.jpg')
-        
-        if os.path.exists(image_path):
-            image = Image.open(image_path).convert('RGB')
-            image_input = preprocess(image).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                image_features = model.encode_image(image_input)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            
-            return image_features.cpu().numpy()[0]
-    except Exception as e:
-        pass
-    
-    return None
-
-def apply_tsne(vectors, n_components=3):
+def apply_pca(vectors, n_components=REDUCED_DIM):
+    """将 CLIP 向量降到当前项目使用的 PCA 紧凑表示。"""
     if len(vectors) == 0:
         return np.array([])
-    
+
     if len(vectors) < n_components:
-        return np.array([np.zeros(n_components) for _ in range(len(vectors))])
-    
-    tsne = TSNE(n_components=n_components, random_state=42, perplexity=min(30, len(vectors) - 1))
-    reduced_vectors = tsne.fit_transform(vectors)
-    
-    return reduced_vectors
+        return np.zeros((len(vectors), n_components), dtype=np.float32)
+
+    pca = PCA(n_components=n_components, random_state=42)
+    return pca.fit_transform(vectors).astype(np.float32)
+
 
 def vector_to_list(vector):
+    """将稠密向量转换为适合写入 CSV 的列表格式。"""
     if vector is None:
         return []
     return vector.tolist()
 
-print("Processing items...")
-results = []
 
-title_clip_vectors = []
-image_clip_vectors = []
-feature_clip_vectors = []
-description_clip_vectors = []
+def count_delimited_values(value, delimiter='|'):
+    """统计以分隔符拼接的列表字段长度，空值返回 0。"""
+    if not isinstance(value, str):
+        return 0
 
-for idx, row in items_df.iterrows():
-    if idx % 100 == 0:
-        print(f"Processing {idx}/{len(items_df)}")
-    
-    asin = row['asin']
-    
-    result = {'asin': asin}
-    
-    for col in items_df.columns:
-        if col == 'asin':
+    tokens = [token.strip() for token in value.split(delimiter) if token.strip()]
+    return len(tokens)
+
+
+def measure_text_length(text):
+    """计算文本字段长度，用于构造额外的结构化统计特征。"""
+    if not isinstance(text, str):
+        return 0
+    return len(text.strip())
+
+
+def fill_remaining_missing_values(df, skip_columns):
+    """在多模态特征构建完成后补齐非向量字段缺失值。"""
+    for col in df.columns:
+        if col in skip_columns:
             continue
-        
-        value = row[col]
-        
-        if pd.isna(value):
-            if items_df[col].dtype in ['float64', 'int64']:
-                result[col] = items_df[col].mean()
-            else:
-                result[col] = ''
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].fillna(df[col].mean())
         else:
-            result[col] = value
-    
-    title = result.get('title', '')
-    result['title_keywords'] = extract_keywords(title)
-    
-    title_clip = encode_text_with_clip(title)
-    title_clip_vectors.append(title_clip)
-    
-    image_clip = load_and_encode_image(asin)
-    image_clip_vectors.append(image_clip)
-    
-    feature_text = result.get('feature', '')
-    feature_clip = encode_text_with_clip(feature_text)
-    feature_clip_vectors.append(feature_clip)
-    
-    description_text = result.get('description', '')
-    description_clip = encode_text_with_clip(description_text)
-    description_clip_vectors.append(description_clip)
-    
-    results.append(result)
+            df[col] = df[col].fillna('')
+    return df
 
-print("Handling missing vectors...")
-title_clip_vectors = np.array([v if v is not None else np.zeros(512) for v in title_clip_vectors])
-image_clip_vectors = np.array([v if v is not None else np.zeros(512) for v in image_clip_vectors])
-feature_clip_vectors = np.array([v if v is not None else np.zeros(512) for v in feature_clip_vectors])
-description_clip_vectors = np.array([v if v is not None else np.zeros(512) for v in description_clip_vectors])
 
-valid_image_indices = [i for i, v in enumerate(image_clip_vectors) if not np.all(v == 0)]
-if len(valid_image_indices) > 0:
-    mean_image_vector = np.mean(image_clip_vectors[valid_image_indices], axis=0)
-    for i, v in enumerate(image_clip_vectors):
-        if np.all(v == 0):
-            image_clip_vectors[i] = mean_image_vector
+def prepare_item_records(items_df):
+    """在多模态编码前逐行整理商品元数据。"""
+    records = []
+    numeric_means = items_df.select_dtypes(include=[np.number]).mean().to_dict()
 
-print("Applying TSNE dimensionality reduction...")
-print("Reducing title vectors to 3D...")
-title_tsne_vectors = apply_tsne(title_clip_vectors, n_components=3)
+    for idx, row in items_df.iterrows():
+        if idx % 100 == 0:
+            print(f"Processing {idx}/{len(items_df)}")
 
-print("Reducing image vectors to 3D...")
-image_tsne_vectors = apply_tsne(image_clip_vectors, n_components=3)
+        record = {'asin': row['asin']}
+        for col in items_df.columns:
+            if col == 'asin':
+                continue
+            value = row[col]
+            if pd.isna(value):
+                record[col] = numeric_means.get(col, '') if col in numeric_means else ''
+            else:
+                record[col] = value
+        record['title_keywords'] = extract_keywords(record.get('title', ''))
+        records.append(record)
 
-print("Reducing feature vectors to 3D...")
-feature_tsne_vectors = apply_tsne(feature_clip_vectors, n_components=3)
+    return records
 
-print("Reducing description vectors to 3D...")
-description_tsne_vectors = apply_tsne(description_clip_vectors, n_components=3)
 
-print("Creating DataFrame...")
-feat_df = pd.DataFrame(results)
+def batch_encode_texts(model, device, texts, batch_size=TEXT_BATCH_SIZE):
+    """以批处理方式编码商品文本字段。"""
+    features = np.zeros((len(texts), VECTOR_DIM), dtype=np.float32)
+    valid_indices = [idx for idx, text in enumerate(texts) if isinstance(text, str) and text.strip()]
 
-print("Adding reduced vectors to DataFrame...")
-feat_df['title_vector'] = [vector_to_list(v) for v in title_tsne_vectors]
-feat_df['image_vector'] = [vector_to_list(v) for v in image_tsne_vectors]
-feat_df['feature_vector'] = [vector_to_list(v) for v in feature_tsne_vectors]
-feat_df['description_vector'] = [vector_to_list(v) for v in description_tsne_vectors]
+    for start in range(0, len(valid_indices), batch_size):
+        batch_indices = valid_indices[start:start + batch_size]
+        batch_texts = [texts[idx] for idx in batch_indices]
+        text_tokens = clip.tokenize(batch_texts, truncate=True).to(device)
 
-print("Filling remaining missing values...")
-for col in feat_df.columns:
-    if col in ['asin', 'title_vector', 'image_vector', 'feature_vector', 'description_vector']:
-        continue
-    
-    if feat_df[col].dtype in ['float64', 'int64']:
-        feat_df[col].fillna(feat_df[col].mean(), inplace=True)
-    else:
-        feat_df[col].fillna('', inplace=True)
+        with torch.no_grad():
+            text_features = model.encode_text(text_tokens)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-print("Saving item features to CSV...")
-feat_df.to_csv('new_feat/item.csv', index=False, encoding='utf-8')
-print(f"Saved {len(feat_df)} items to new_feat/item.csv")
+        features[batch_indices] = text_features.cpu().numpy()
 
-print("\n=== Feature Statistics ===")
-print(f"Total items: {len(feat_df)}")
-print(f"Total features: {len(feat_df.columns)}")
+    return features
 
-print(f"\nTitle TSNE vectors:")
-print(f"  Shape: {title_tsne_vectors.shape}")
-print(f"  Mean: {title_tsne_vectors.mean():.6f}")
-print(f"  Std: {title_tsne_vectors.std():.6f}")
 
-print(f"\nImage TSNE vectors:")
-print(f"  Shape: {image_tsne_vectors.shape}")
-print(f"  Mean: {image_tsne_vectors.mean():.6f}")
-print(f"  Std: {image_tsne_vectors.std():.6f}")
+def batch_encode_images(model, preprocess, device, asins, batch_size=IMAGE_BATCH_SIZE):
+    """批量编码本地图像，并返回哪些商品真正拥有可用图像。"""
+    features = np.zeros((len(asins), VECTOR_DIM), dtype=np.float32)
+    image_tensors = []
+    image_indices = []
 
-print(f"\nFeature TSNE vectors:")
-print(f"  Shape: {feature_tsne_vectors.shape}")
-print(f"  Mean: {feature_tsne_vectors.mean():.6f}")
-print(f"  Std: {feature_tsne_vectors.std():.6f}")
+    for idx, asin in enumerate(asins):
+        if not isinstance(asin, str) or not asin:
+            continue
 
-print(f"\nDescription TSNE vectors:")
-print(f"  Shape: {description_tsne_vectors.shape}")
-print(f"  Mean: {description_tsne_vectors.mean():.6f}")
-print(f"  Std: {description_tsne_vectors.std():.6f}")
+        image_path = os.path.join('images', f'{asin}.jpg')
+        if not os.path.exists(image_path):
+            continue
 
-print(f"\n=== Feature columns ===")
-print(f"Columns in item.csv: {list(feat_df.columns)}")
+        try:
+            with Image.open(image_path) as image:
+                image_tensor = preprocess(image.convert('RGB'))
+            image_tensors.append(image_tensor)
+            image_indices.append(idx)
+        except Exception:
+            continue
 
-print("\n=== Sample data ===")
-print(f"First item ASIN: {feat_df.iloc[0]['asin']}")
-print(f"Title keywords: {feat_df.iloc[0]['title_keywords']}")
-print(f"Title vector (first 3 dims): {feat_df.iloc[0]['title_vector']}")
-print(f"Image vector (first 3 dims): {feat_df.iloc[0]['image_vector']}")
-print(f"Feature vector (first 3 dims): {feat_df.iloc[0]['feature_vector']}")
-print(f"Description vector (first 3 dims): {feat_df.iloc[0]['description_vector']}")
+    for start in range(0, len(image_tensors), batch_size):
+        batch_tensors = torch.stack(image_tensors[start:start + batch_size]).to(device)
+        batch_indices = image_indices[start:start + batch_size]
 
-print("\n=== Completed ===")
-print("Generated files:")
-print("  - new_feat/item.csv (item features with 3D vectors stored as lists)")
+        with torch.no_grad():
+            image_features = model.encode_image(batch_tensors)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        features[batch_indices] = image_features.cpu().numpy()
+
+    valid_mask = np.zeros(len(asins), dtype=np.float32)
+    if image_indices:
+        valid_mask[image_indices] = 1.0
+
+    return features, valid_mask
+
+
+def main():
+    """生成包含文本与图像信息的 `new_feat/item.csv`。"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("Loading data...")
+    items_df = pd.read_csv('new_dataset/item.csv')
+    items_df = items_df.drop_duplicates(subset=['asin']).reset_index(drop=True)
+    print(f"Loaded {len(items_df)} items")
+
+    print("Loading CLIP model...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
+    print(f"CLIP model loaded on {device}")
+
+    # 第一阶段：整理原始商品字段，保证输出模式稳定。
+    print("Processing items...")
+    records = prepare_item_records(items_df)
+    feat_df = pd.DataFrame(records)
+
+    title_texts = feat_df['title'].fillna('').astype(str).tolist()
+    feature_texts = feat_df['feature'].fillna('').astype(str).tolist()
+    description_texts = feat_df['description'].fillna('').astype(str).tolist()
+    asins = feat_df['asin'].astype(str).tolist()
+
+    # 第二阶段：批量编码三种文本模态和本地图像模态。
+    print("Encoding text fields with CLIP...")
+    title_clip_vectors = batch_encode_texts(model, device, title_texts)
+    feature_clip_vectors = batch_encode_texts(model, device, feature_texts)
+    description_clip_vectors = batch_encode_texts(model, device, description_texts)
+
+    print("Encoding item images with CLIP...")
+    image_clip_vectors, image_valid_mask = batch_encode_images(model, preprocess, device, asins)
+
+    # 第三阶段：将高维 CLIP 向量压缩为模型当前使用的 64 维表示。
+    print("Applying PCA dimensionality reduction...")
+    print(f"Reducing title vectors to {REDUCED_DIM}D...")
+    title_pca_vectors = apply_pca(title_clip_vectors, n_components=REDUCED_DIM)
+
+    print(f"Reducing image vectors to {REDUCED_DIM}D...")
+    image_pca_vectors = apply_pca(image_clip_vectors, n_components=REDUCED_DIM)
+
+    print(f"Reducing feature vectors to {REDUCED_DIM}D...")
+    feature_pca_vectors = apply_pca(feature_clip_vectors, n_components=REDUCED_DIM)
+
+    print(f"Reducing description vectors to {REDUCED_DIM}D...")
+    description_pca_vectors = apply_pca(description_clip_vectors, n_components=REDUCED_DIM)
+
+    print("Adding reduced vectors to DataFrame...")
+    feat_df['title_vector'] = [vector_to_list(v) for v in title_pca_vectors]
+    feat_df['image_vector'] = [vector_to_list(v) for v in image_pca_vectors]
+    feat_df['feature_vector'] = [vector_to_list(v) for v in feature_pca_vectors]
+    feat_df['description_vector'] = [vector_to_list(v) for v in description_pca_vectors]
+    feat_df['has_image'] = image_valid_mask.astype(np.float32)
+    feat_df['has_price'] = feat_df['price'].fillna('').astype(str).str.strip().ne('').astype(np.float32)
+    feat_df['has_feature'] = feat_df['feature'].fillna('').astype(str).str.strip().ne('').astype(np.float32)
+    feat_df['has_description'] = feat_df['description'].fillna('').astype(str).str.strip().ne('').astype(np.float32)
+    feat_df['title_length'] = feat_df['title'].apply(measure_text_length).astype(np.float32)
+    feat_df['feature_length'] = feat_df['feature'].apply(measure_text_length).astype(np.float32)
+    feat_df['description_length'] = feat_df['description'].apply(measure_text_length).astype(np.float32)
+    feat_df['also_view_count'] = feat_df['also_view'].apply(count_delimited_values).astype(np.float32)
+    feat_df['also_buy_count'] = feat_df['also_buy'].apply(count_delimited_values).astype(np.float32)
+
+    print("Filling remaining missing values...")
+    feat_df = fill_remaining_missing_values(
+        feat_df,
+        skip_columns={'asin', 'title_vector', 'image_vector', 'feature_vector', 'description_vector'}
+    )
+
+    # 第四阶段：输出 DataPreprocessor 直接使用的商品特征表。
+    print("Saving item features to CSV...")
+    feat_df.to_csv(ITEM_OUTPUT_PATH, index=False, encoding='utf-8')
+    print(f"Saved {len(feat_df)} items to {ITEM_OUTPUT_PATH}")
+
+    print("\n=== Feature Statistics ===")
+    print(f"Total items: {len(feat_df)}")
+    print(f"Total features: {len(feat_df.columns)}")
+
+    print("\nTitle PCA vectors:")
+    print(f"  Shape: {title_pca_vectors.shape}")
+    print(f"  Mean: {title_pca_vectors.mean():.6f}")
+    print(f"  Std: {title_pca_vectors.std():.6f}")
+
+    print("\nImage PCA vectors:")
+    print(f"  Shape: {image_pca_vectors.shape}")
+    print(f"  Mean: {image_pca_vectors.mean():.6f}")
+    print(f"  Std: {image_pca_vectors.std():.6f}")
+
+    print("\nFeature PCA vectors:")
+    print(f"  Shape: {feature_pca_vectors.shape}")
+    print(f"  Mean: {feature_pca_vectors.mean():.6f}")
+    print(f"  Std: {feature_pca_vectors.std():.6f}")
+
+    print("\nDescription PCA vectors:")
+    print(f"  Shape: {description_pca_vectors.shape}")
+    print(f"  Mean: {description_pca_vectors.mean():.6f}")
+    print(f"  Std: {description_pca_vectors.std():.6f}")
+
+    print("\n=== Feature columns ===")
+    print(f"Columns in item.csv: {list(feat_df.columns)}")
+
+    print("\n=== Sample data ===")
+    print(f"First item ASIN: {feat_df.iloc[0]['asin']}")
+    print(f"Title keywords: {feat_df.iloc[0]['title_keywords']}")
+    print(f"Title vector (first 3 dims): {feat_df.iloc[0]['title_vector']}")
+    print(f"Image vector (first 3 dims): {feat_df.iloc[0]['image_vector']}")
+    print(f"Feature vector (first 3 dims): {feat_df.iloc[0]['feature_vector']}")
+    print(f"Description vector (first 3 dims): {feat_df.iloc[0]['description_vector']}")
+
+    print("\n=== Completed ===")
+    print("Generated files:")
+    print(f"  - new_feat/item.csv (item features with {REDUCED_DIM}D PCA vectors stored as lists)")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,19 +1,28 @@
+"""LightGCN 及其多模态扩展实现。"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import degree
 
+def build_lightgcn_norm(edge_index, num_nodes, dtype):
+    """Precompute symmetric normalization weights for a fixed graph."""
+    row, col = edge_index
+    deg = degree(col, num_nodes, dtype=dtype)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+    return deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
 class LightGCNConv(MessagePassing):
+    """LightGCN 的图卷积传播层。"""
     def __init__(self):
         super(LightGCNConv, self).__init__(aggr='add')
 
-    def forward(self, x, edge_index):
-        row, col = edge_index
-        deg = degree(col, x.size(0), dtype=x.dtype)
-        deg_inv_sqrt = deg.pow(-0.5)
-        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+    def forward(self, x, edge_index, norm=None):
+        """按 LightGCN 的归一化规则进行消息传播。"""
+        if norm is None:
+            norm = build_lightgcn_norm(edge_index, x.size(0), x.dtype)
         out = self.propagate(edge_index, x=x, norm=norm)
         return out
 
@@ -21,6 +30,7 @@ class LightGCNConv(MessagePassing):
         return norm.view(-1, 1) * x_j
 
 class LightGCN(nn.Module):
+    """标准 LightGCN 模型。"""
     def __init__(self, num_users, num_items, embedding_dim=64, num_layers=3,
                  user_feat_dim=0, item_feat_dim=0, dropout=0.1):
         super(LightGCN, self).__init__()
@@ -48,6 +58,7 @@ class LightGCN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, edge_index, user_features=None, item_features=None):
+        """在用户-商品图上进行多层传播，输出最终嵌入。"""
         user_emb = self.user_embedding.weight
         item_emb = self.item_embedding.weight
 
@@ -76,6 +87,7 @@ class LightGCN(nn.Module):
         return user_final_emb, item_final_emb
 
     def predict(self, user_ids, item_ids, edge_index, user_features=None, item_features=None):
+        """根据传播后的嵌入计算指定用户和商品的匹配分数。"""
         user_emb, item_emb = self.forward(edge_index, user_features, item_features)
         user_emb = user_emb[user_ids]
         item_emb = item_emb[item_ids]
@@ -83,14 +95,19 @@ class LightGCN(nn.Module):
         return scores
 
 class MultiModalLightGCN(nn.Module):
+    """融合用户/商品多模态特征的 LightGCN 版本。"""
     def __init__(self, num_users, num_items, embedding_dim=64, num_layers=3,
-                 user_numeric_dim=12, user_vector_dim=3, num_colors=22, 
-                 num_sizes=18, item_numeric_dim=5, item_vector_dim=12,
+                 user_numeric_dim=12, user_vector_dim=3, num_colors=23, 
+                 num_sizes=19, item_numeric_dim=5, item_vector_dim=12,
                  dropout=0.1):
         super(MultiModalLightGCN, self).__init__()
         self.num_users = num_users
         self.num_items = num_items
         self.embedding_dim = embedding_dim
+        self.user_numeric_dim = user_numeric_dim
+        self.user_vector_dim = user_vector_dim
+        self.item_numeric_dim = item_numeric_dim
+        self.item_vector_dim = item_vector_dim
 
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.item_embedding = nn.Embedding(num_items, embedding_dim)
@@ -118,12 +135,15 @@ class MultiModalLightGCN(nn.Module):
 
     def forward(self, edge_index, user_features=None, user_color_indices=None, 
                 user_size_indices=None, item_features=None):
+        """将显式特征注入初始嵌入后进行图传播。"""
         user_emb = self.user_embedding.weight
         item_emb = self.item_embedding.weight
 
         if user_features is not None:
-            user_numeric_emb = self.user_numeric_fc(user_features[:, :12])
-            user_vector_emb = self.user_vector_fc(user_features[:, 12:15])
+            user_numeric_emb = self.user_numeric_fc(user_features[:, :self.user_numeric_dim])
+            user_vector_emb = self.user_vector_fc(
+                user_features[:, self.user_numeric_dim:self.user_numeric_dim + self.user_vector_dim]
+            )
             user_emb = user_emb + user_numeric_emb + user_vector_emb
 
         if user_color_indices is not None:
@@ -135,8 +155,10 @@ class MultiModalLightGCN(nn.Module):
             user_emb = user_emb + size_emb
 
         if item_features is not None:
-            item_numeric_emb = self.item_numeric_fc(item_features[:, :5])
-            item_vector_emb = self.item_vector_fc(item_features[:, 5:])
+            item_numeric_emb = self.item_numeric_fc(item_features[:, :self.item_numeric_dim])
+            item_vector_emb = self.item_vector_fc(
+                item_features[:, self.item_numeric_dim:self.item_numeric_dim + self.item_vector_dim]
+            )
             item_emb = item_emb + item_numeric_emb + item_vector_emb
 
         all_embeddings = torch.cat([user_emb, item_emb], dim=0)
@@ -157,6 +179,7 @@ class MultiModalLightGCN(nn.Module):
 
     def predict(self, user_ids, item_ids, edge_index, user_features=None,
                 user_color_indices=None, user_size_indices=None, item_features=None):
+        """输出指定用户与指定商品的匹配分数。"""
         user_emb, item_emb = self.forward(edge_index, user_features, user_color_indices,
                                           user_size_indices, item_features)
         user_emb = user_emb[user_ids]

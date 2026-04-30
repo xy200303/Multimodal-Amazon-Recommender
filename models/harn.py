@@ -1,17 +1,24 @@
+"""混合注意力推荐网络（HARN）。
+
+该模型不是双塔结构，而是直接在用户与商品特征之间建模交互，
+用于与双塔体系形成结构性对比。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class FeatureEmbedding(nn.Module):
+    """将用户侧与商品侧的原始输入映射到统一表示空间。"""
     def __init__(self, num_users, num_items, user_feature_dim, item_feature_dim, 
-                 embedding_dim=64):
+                 embedding_dim=64, num_colors=23, num_sizes=19):
         super(FeatureEmbedding, self).__init__()
         self.embedding_dim = embedding_dim
         
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.item_embedding = nn.Embedding(num_items, embedding_dim)
-        self.color_embedding = nn.Embedding(22, embedding_dim // 2)
-        self.size_embedding = nn.Embedding(18, embedding_dim // 2)
+        self.color_embedding = nn.Embedding(num_colors, embedding_dim // 2)
+        self.size_embedding = nn.Embedding(num_sizes, embedding_dim // 2)
         
         self.user_feature_proj = nn.Linear(user_feature_dim, embedding_dim)
         self.item_feature_proj = nn.Linear(item_feature_dim, embedding_dim)
@@ -23,6 +30,7 @@ class FeatureEmbedding(nn.Module):
         
     def forward(self, user_idx, user_features, user_color_idx, user_size_idx, 
                 item_idx, item_features):
+        """输出用户组合特征与商品组合特征。"""
         user_emb = self.user_embedding(user_idx)
         item_emb = self.item_embedding(item_idx)
         color_emb = self.color_embedding(user_color_idx)
@@ -37,6 +45,7 @@ class FeatureEmbedding(nn.Module):
         return user_features_combined, item_features_combined
 
 class CrossAttention(nn.Module):
+    """用户与商品之间的跨特征注意力模块。"""
     def __init__(self, user_dim, item_dim, output_dim, num_heads=4):
         super(CrossAttention, self).__init__()
         self.num_heads = num_heads
@@ -73,6 +82,7 @@ class CrossAttention(nn.Module):
         return out.squeeze(1)
 
 class FeatureInteraction(nn.Module):
+    """带残差连接的前馈交互层。"""
     def __init__(self, input_dim, hidden_dim):
         super(FeatureInteraction, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -88,6 +98,7 @@ class FeatureInteraction(nn.Module):
         return x
 
 class MultiScaleAttention(nn.Module):
+    """使用不同头数的注意力并行建模多尺度信息。"""
     def __init__(self, embed_dim, num_heads_list=[2, 4, 8]):
         super(MultiScaleAttention, self).__init__()
         self.attention_layers = nn.ModuleList([
@@ -112,15 +123,17 @@ class MultiScaleAttention(nn.Module):
         return output
 
 class HybridAttentionRecommendationNetwork(nn.Module):
+    """通过跨注意力与多尺度注意力进行深层交互建模。"""
     def __init__(self, num_users, num_items, user_feature_dim, item_feature_dim, 
-                 embedding_dim=64, hidden_dims=[256, 128, 64], dropout=0.2):
+                 embedding_dim=64, hidden_dims=[256, 128, 64], dropout=0.2,
+                 num_colors=23, num_sizes=19):
         super(HybridAttentionRecommendationNetwork, self).__init__()
         self.num_users = num_users
         self.num_items = num_items
         self.embedding_dim = embedding_dim
         
         self.feature_embedding = FeatureEmbedding(
-            num_users, num_items, user_feature_dim, item_feature_dim, embedding_dim
+            num_users, num_items, user_feature_dim, item_feature_dim, embedding_dim, num_colors, num_sizes
         )
         
         user_combined_dim = embedding_dim + embedding_dim // 2 + embedding_dim // 2 + embedding_dim
@@ -155,6 +168,7 @@ class HybridAttentionRecommendationNetwork(nn.Module):
         
     def forward(self, user_idx, user_features, user_color_idx, user_size_idx, 
                 item_idx, item_features):
+        """直接输出用户-商品交互得分。"""
         user_combined, item_combined = self.feature_embedding(
             user_idx, user_features, user_color_idx, user_size_idx, 
             item_idx, item_features
@@ -175,6 +189,7 @@ class HybridAttentionRecommendationNetwork(nn.Module):
     
     def get_user_item_interaction(self, user_idx, user_features, user_color_idx, 
                                   user_size_idx, item_idx, item_features):
+        """导出中间交互表征，便于分析与可视化。"""
         user_combined, item_combined = self.feature_embedding(
             user_idx, user_features, user_color_idx, user_size_idx, 
             item_idx, item_features
